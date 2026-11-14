@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>完全独立型ゴルフ距離測定</title>
+  <style>
+    html, body {
+      height: 100%;
+      width: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #222;
+      font-family: sans-serif;
+      user-select: none;
+    }
+    #canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      touch-action: none;
+    }
+    #info {
+      position: fixed;
+      top: 15px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.85);
+      color: #fff;
+      padding: 10px 22px;
+      border-radius: 25px;
+      font-size: 18px;
+      font-weight: bold;
+      z-index: 10;
+      white-space: nowrap;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    }
+    #controls {
+      position: fixed;
+      bottom: 25px;
+      right: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      z-index: 10;
+    }
+    button {
+      background: #fff;
+      color: #333;
+      border: none;
+      padding: 12px 16px;
+      border-radius: 25px;
+      font-size: 14px;
+      font-weight: bold;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.4);
+      cursor: pointer;
+    }
+    button:active {
+      background: #ddd;
+    }
+  </style>
+</head>
+<body>
+
+<div id="info">目標地点をタップしてください</div>
+<div id="controls">
+  <button id="zoom-in">＋ 拡大</button>
+  <button id="zoom-out">－ 縮小</button>
+  <button id="center-btn">現在地へ</button>
+</div>
+<canvas id="canvas"></canvas>
+
+<script>
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const info = document.getElementById('info');
+
+  // 初期設定（初期中心は東京駅付近、ズーム17）
+  let centerLat = 35.681236;
+  let centerLng = 139.767125;
+  let zoom = 17;
+
+  let currentLat = null;
+  let currentLng = null;
+  let targetLat = null;
+  let targetLng = null;
+  let isFirstGPS = true;
+
+  const tileCache = {};
+
+  function resize() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+    draw();
+  }
+  window.addEventListener('resize', resize);
+
+  // 緯度経度 ⇔ 世界ピクセル座標の変換関数
+  function latLngToPoint(lat, lng, z) {
+    const scale = 256 * Math.pow(2, z);
+    const x = (lng + 180) / 360 * scale;
+    const sinLat = Math.sin(lat * Math.PI / 180);
+    const y = (0.5 - Math.log((1 + sinLat) / (1 - sinLat)) / (4 * Math.PI)) * scale;
+    return { x, y };
+  }
+
+  function pointToLatLng(x, y, z) {
+    const scale = 256 * Math.pow(2, z);
+    const lng = x / scale * 360 - 180;
+    const n = Math.PI - 2 * Math.PI * y / scale;
+    const lat = 180 / Math.PI * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+    return { lat, lng };
+  }
+
+  // 2点間の距離計算（ヒュベニの公式の簡易版：ヒュベニ/ハバーサイン）
+  function calcYards(lat1, lng1, lat2, lng2) {
+    const R = 6378137; // 地球の半径(m)
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLng = (lng2 - lng1) * Math.PI / 180;
+    const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+              Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+              Math.sin(dLng/2) * Math.sin(dLng/2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    const meters = R * c;
+    return Math.round(meters * 1.09361);
+  }
+
+  // 地図とピンと線の描画
+  function draw() {
+    ctx.fillStyle = '#222';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    const centerPt = latLngToPoint(centerLat, centerLng, zoom);
+    const topLeftX = centerPt.x - canvas.width / 2;
+    const topLeftY = centerPt.y - canvas.height / 2;
+
+    const startTileX = Math.floor(topLeftX / 256);
+    const startTileY = Math.floor(topLeftY / 256);
+    const endTileX = Math.floor((topLeftX + canvas.width) / 256);
+    const endTileY = Math.floor((topLeftY + canvas.height) / 256);
+
+    // 国土地理院の航空写真タイルを描画
+    for (let tx = startTileX; tx <= endTileX; tx++) {
+      for (let ty = startTileY; ty <= endTileY; ty++) {
+        const key = `${zoom}/${tx}/${ty}`;
+        const drawX = tx * 256 - topLeftX;
+        const drawY = ty * 256 - topLeftY;
+
+        if (tileCache[key]) {
+          if (tileCache[key].complete && tileCache[key].naturalWidth > 0) {
+            ctx.drawImage(tileCache[key], drawX, drawY, 256, 256);
+          }
+        } else {
+          const img = new Image();
+          img.src = `https://gsi.go.jp{zoom}/${tx}/${ty}.jpg`;
+          img.onload = () => draw();
+          tileCache[key] = img;
+        }
+      }
+    }
+
+    // 2点間の赤い線を描画
+    if (currentLat !== null && targetLat !== null) {
+      const p1 = latLngToPoint(currentLat, currentLng, zoom);
+      const p2 = latLngToPoint(targetLat, targetLng, zoom);
+      ctx.beginPath();
+      ctx.moveTo(p1.x - topLeftX, p1.y - topLeftY);
+      ctx.lineTo(p2.x - topLeftX, p2.y - topLeftY);
+      ctx.strokeStyle = '#FF3B30';
+      ctx.lineWidth = 3;
+      ctx.setLineDash([6, 6]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    // 現在地（青い丸）を描画
+    if (currentLat !== null) {
+      const p = latLngToPoint(currentLat, currentLng, zoom);
+      ctx.beginPath();
+      ctx.arc(p.x - topLeftX, p.y - topLeftY, 8, 0, Math.PI * 2);
+      ctx.fillStyle = '#4285F4';
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#fff';
+      ctx.stroke();
+    }
+
+    // 目標地点（赤い丸）を描画
+    if (targetLat !== null) {
+      const p = latLngToPoint(targetLat, targetLng, zoom);
+      ctx.beginPath();
+      ctx.arc(p.x - topLeftX, p.y - topLeftY, 8, 0, Math.PI * 2);
+      ctx.fillStyle = '#FF3B30';
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#fff';
+      ctx.stroke();
+    }
+  }
+
+  function updateInfo() {
+    if (currentLat !== null && targetLat !== null) {
+      const yards = calcYards(currentLat, currentLng, targetLat, targetLng);
+      info.textContent = `残り ${yards} ヤード`;
+    }
+  }
+
+  // ドラッグ移動とタップの判定
+  let isDragging = false;
+  let dragStartX = 0;
+  let dragStartY = 0;
+  let startCenterPt = null;
+  let moved = false;
+
+  canvas.addEventListener('pointerdown', (e) => {
+    isDragging = true;
+    moved = false;
+    dragStartX = e.clientX;
+    dragStartY = e.clientY;
+    startCenterPt = latLngToPoint(centerLat, centerLng, zoom);
+  });
+
+  canvas.addEventListener('pointermove', (e) => {
+    if (!isDragging) return;
+    const dx = e.clientX - dragStartX;
+    const dy = e.clientY - dragStartY;
+    if (Math.abs(dx) > 5 || Math.abs(dy) > 5) moved = true;
+    if (moved) {
+      const newCenter = pointToLatLng(startCenterPt.x - dx, startCenterPt.y - dy, zoom);
+      centerLat = newCenter.lat;
+      centerLng = newCenter.lng;
+      draw();
+    }
+  });
+
+  canvas.addEventListener('pointerup', (e) => {
+    isDragging = false;
+    // ドラッグではなく「タップ」だった場合、目標地点を設置
+    if (!moved) {
+      const centerPt = latLngToPoint(centerLat, centerLng, zoom);
+      const clickX = centerPt.x - canvas.width / 2 + e.clientX;
+      const clickY = centerPt.y - canvas.height / 2 + e.clientY;
+      const tapped = pointToLatLng(clickX, clickY, zoom);
+      targetLat = tapped.lat;
+      targetLng = tapped.lng;
+      updateInfo();
+      draw();
+    }
+  });
+
+  // ボタン操作
+  document.getElementById('zoom-in').addEventListener('click', () => {
+    if (zoom < 18) { zoom++; draw(); }
+  });
+  document.getElementById('zoom-out').addEventListener('click', () => {
+    if (zoom > 14) { zoom--; draw(); }
+  });
+  document.getElementById('center-btn').addEventListener('click', () => {
+    if (currentLat !== null) {
+      centerLat = currentLat;
+      centerLng = currentLng;
+      draw();
+    } else {
+      alert('現在地をまだ取得できていません');
+    }
+  });
+
+  // GPSの監視
+  if (navigator.geolocation) {
+    navigator.geolocation.watchPosition((pos) => {
+      currentLat = pos.coords.latitude;
+      currentLng = pos.coords.longitude;
+      if (isFirstGPS) {
+        centerLat = currentLat;
+        centerLng = currentLng;
+        isFirstGPS = false;
+      }
+      updateInfo();
+      draw();
+    }, () => {
+      info.textContent = 'GPS待機中（目標タップ可能）';
+    }, { enableHighAccuracy: true });
+  }
+
+  resize();
+</script>
+</body>
+</html>
